@@ -1,0 +1,296 @@
+---
+title: "Text Mining in Ecology & Evolution: LGBTQ+ Sentiment Over Time"
+author: "Robert J. Dellinger"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+---
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(rcrossref)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(stringr)
+library(tidytext)
+library(textdata)
+library(ggplot2)
+library(forcats)
+library(tidyr)
+```
+
+# 1. Overview
+This document analyzes the use and sentiment of LGBTQ+ related terms in ecology and evolution journals over time using CrossRef metadata and tidy text mining approaches.
+
+# 2. Define Search Terms
+```{r}
+search_terms <- c(
+  "gay", "lesbian", "bisexual", "queer",  "trans", "transgender", "transsexual",
+  "nonbinary", "genderqueer", "agender", "intersex", "asexual", "homosexual",
+  "homosexuality", "sexual inversion", "transvestite", "hermaphrodite", "androgyne",
+  "same sex", "same-sex", "same-sex behaviour", "same-sex behavior", "unusual mating",
+  "sex change", "gender change", "sex reversal", "alloparental", "polygamy",
+  "polyandry", "polyamory", "gay gene", "genetic basis of sexuality"
+)
+```
+
+# 3. Define Query Function
+
+The search terms are a combination of broad identity terms and specific phrases related to LGBTQ+ topics. The goal is to capture a wide range of articles that may discuss these topics in the context of ecology and evolution.
+
+```{r Query-Function}
+
+# Define helper function
+query_journal <- function(journal_name) {
+  issns <- cr_journals(query = journal_name)$data$issn %>%
+    discard(is.na) %>% unique()
+
+  search_grid <- expand_grid(term = search_terms, issn = issns)
+
+  results <- pmap_dfr(search_grid, function(term, issn) {
+    message("Querying ", journal_name, " for: ", term, " | ", issn)
+    tryCatch({
+      res <- cr_works(
+        query = term,
+        filter = c(
+          type = "journal-article",
+          has_abstract = TRUE,
+          issn = issn
+        ),
+        sort = "relevance",
+        order = "desc",
+        cursor = "*",
+        cursor_max = 500,
+        limit = 500
+      )$data
+      res$term <- term
+      res$issn <- issn
+      res
+    }, error = function(e) tibble())
+  })
+
+  results %>%
+    select(term, title, container.title, journal, issued, abstract, doi, url, references.count,
+           is.referenced.by.count)
+}
+```
+
+# 4. Query Journals
+This function queries the CrossRef API for articles in a specific journal that contain any of the specified search terms. It retrieves relevant metadata, including the title, journal name, publication date, abstract, DOI, and reference counts.
+
+```{r Journal-Query}
+
+# Query each journal
+jeb_results <- query_journal("Journal of Evolutionary Biology")
+eco_evo_results <- query_journal("Ecology and Evolution")
+ecology_results <- query_journal("Ecology")
+eco_letters_results <- query_journal("Ecology Letters")
+evo_eco_results <- query_journal("Evolutionary Ecology")
+
+# Combine all results
+all_results <- bind_rows(
+  jeb_results,
+  eco_evo_results,
+  ecology_results,
+  eco_letters_results,
+  evo_eco_results
+)
+
+# Remove duplicate DOIs
+all_results_unique <- all_results %>%
+  distinct(doi, .keep_all = TRUE)
+```
+The results from the queries are combined into a single data frame, and duplicate DOIs are removed to ensure that each article is represented only once.
+
+# 5. Text Preprocessing and Tokenization
+
+This section performs text mining on the abstracts of the retrieved articles. It cleans the text data, tokenizes it into words, and removes common stop words. The goal is to analyze the frequency of words over time.
+
+```{r Text-Mining}
+text_df <- all_results_unique %>%
+  mutate(
+    full_text = paste(title, abstract, sep = " "),
+    full_text = str_to_lower(full_text),
+    full_text = str_replace_all(full_text, "<.*?>", " "),
+    full_text = str_replace_all(full_text, "\\s+", " "),
+    year = str_extract(issued, "^\\d{4}") %>% as.integer(),
+    decade = floor(year / 10) * 10
+  )
+```
+
+# 6. Top Words by Decade
+
+```{r Text-Mining}
+data("stop_words")
+
+tidy_words <- text_df %>%
+  unnest_tokens(word, full_text) %>%
+  anti_join(stop_words, by = "word") %>%
+  dplyr::filter(
+    !str_detect(word, "^[0-9.,]+$"),         # removes pure numbers with decimals/commas
+    !str_detect(word, "^[0-9]+[a-z]+$"),     # removes things like 2w, 3rd
+    !str_detect(word, "^jats"),              # removes jats formatting
+    !word %in% c("abstract", "content")      # removes irrelevant XML terms
+  )
+
+# Top words by decade using reorder_within for facet-safe ordering
+top_words_decade <- tidy_words %>%
+  count(decade, word, sort = TRUE) %>%
+  group_by(decade) %>%
+  slice_max(n, n = 20, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(word = fct_reorder2(word, n, decade))
+
+
+ggplot(top_words_decade, aes(x = fct_reorder(word, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  facet_wrap(~ decade, scales = "free_y") +
+  labs(
+    title = "Top 20 Words by Decade",
+    x = NULL, y = "Count"
+  ) +
+  theme_minimal()
+```
+
+
+
+# 7. Sentiment Analysis: Bing
+
+This section performs sentiment analysis on the tokenized words using two different lexicons: Bing and NRC. The goal is to calculate sentiment scores for each decade and visualize the results.. The results are visualized to show the net sentiment over time.
+
+```{r Sentiment-Analysis}
+# Load sentiment lexicon
+bing <- get_sentiments("bing")
+
+# Calculate sentiment scores per decade (from all tidy words)
+sentiment_scores_decade <- tidy_words %>%
+  inner_join(bing, by = "word") %>%
+  count(decade, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(net_sentiment = positive - negative)
+
+# Optional: Normalize by total word count per decade
+word_counts_decade <- tidy_words %>%
+  count(decade, name = "total_words")
+
+sentiment_normalized <- sentiment_scores_decade %>%
+  left_join(word_counts_decade, by = "decade") %>%
+  mutate(norm_net_sentiment = net_sentiment / total_words)
+
+# Plot: Normalized Net Sentiment by Decade
+ggplot(sentiment_normalized, aes(x = factor(decade), y = norm_net_sentiment)) +
+  geom_col(fill = "darkred") +
+  labs(
+    title = "Normalized Net Sentiment by Decade\nin Ecology & Evolution Journals",
+    x = "Decade", y = "Net Sentiment per Word"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+# 8. Sentiment Analysis: NRC (Emotions)
+
+This section uses the NRC lexicon to analyze specific emotions (anger, fear, sadness, disgust) in the text data. The results are visualized to show the frequency of these emotions over time.
+
+```{r Sentiment-Analysis}
+# Load NRC lexicon
+nrc <- get_sentiments("nrc")
+
+# Recalculate total word count per decade (if needed)
+word_counts_decade <- tidy_words %>%
+  count(decade, name = "total_words")
+
+# Count NRC emotion-tagged words per decade (excluding general valence)
+nrc_sentiment_counts <- tidy_words %>%
+  inner_join(nrc, by = "word") %>%
+  count(decade, sentiment)
+
+# Normalize by total word count
+nrc_sentiment_normalized <- nrc_sentiment_counts %>%
+  left_join(word_counts_decade, by = "decade") %>%
+  mutate(freq = n / total_words)
+
+nrc_sentiment_normalized %>%
+  dplyr::filter(sentiment %in% c("anger", "fear", "sadness", "disgust")) %>%
+  ggplot(aes(x = factor(decade), y = freq, fill = sentiment)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Negative Emotional Language in Ecology & Evolution Journals",
+    x = "Decade",
+    y = "Emotion Frequency per Word",
+    fill = "Emotion"
+  ) +
+  theme_minimal(base_size = 14)
+
+nrc_sentiment_normalized %>%
+  ggplot(aes(x = factor(decade), y = freq, fill = sentiment)) +
+  geom_col(position = "stack") +
+  labs(
+    title = "Emotional Language Trends in Ecology & Evolution Journals",
+    x = "Decade",
+    y = "Normalized Emotion Frequency",
+    fill = "NRC Emotion"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+# 9/ Keyword-in-context (KWIC) concordance analysis
+
+```{r KWIC-Analysis}
+
+# Define LGBTQ+ identity terms
+kwic_terms <- c(
+  "deviant", "abnormal", "mutation", "unnatural", "disorder", "perversion",
+  "maladaptive", "defective", "dysfunction", "unfit", "inversion", "inverted",
+  "biological anomaly", "genetic defect", "immoral", "unproductive", 
+  "failed reproduction", "atypical", "contrary sex roles", "unusual mating"
+)
+
+# Extract and annotate KWIC sentences
+kwic_sentences <- all_results_unique %>%
+  mutate(
+    year = str_extract(issued, "^\\d{4}") %>% as.integer(),
+    full_text = paste(title, abstract, sep = " "),
+    full_text = str_to_lower(full_text),
+    full_text = str_replace_all(full_text, "<.*?>", " "),
+    full_text = str_replace_all(full_text, "\\s+", " ")
+  ) %>%
+  unnest_tokens(sentence, full_text, token = "sentences") %>%
+  dplyr::filter(str_detect(sentence, str_c("\\b(", str_c(kwic_terms, collapse = "|"), ")\\b"))) %>%
+  mutate(
+    keyword = str_extract(sentence, str_c("\\b(", str_c(kwic_terms, collapse = "|"), ")\\b")),
+    left_context = str_trim(str_replace(sentence, str_c("^(.*)\\b", keyword, "\\b.*$"), "\\1")),
+    right_context = str_trim(str_replace(sentence, str_c("^.*\\b", keyword, "\\b(.*)$"), "\\1"))
+  ) %>%
+  select(year, keyword, sentence, left_context, right_context)
+
+# Optional: View flagged examples
+print(kwic_sentences, width = Inf)
+
+total_abstracts_by_year <- all_results_unique %>%
+  mutate(year = str_extract(issued, "^\\d{4}") %>% as.integer()) %>%
+  count(year, name = "total_docs")
+
+pejorative_counts <- kwic_sentences %>%
+  count(year, name = "pejorative_hits")
+
+normalized_pejorative <- left_join(pejorative_counts, total_abstracts_by_year, by = "year") %>%
+  mutate(freq_per_doc = pejorative_hits / total_docs)
+
+ggplot(normalized_pejorative, aes(x = year, y = freq_per_doc)) +
+  geom_line(size = 1, color = "darkred") +
+  labs(
+    title = "Normalized Use of Pathologizing Terms in LGBTQ+ Ecology/Evolution Abstracts",
+    x = "Year", y = "Frequency per Abstract"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
